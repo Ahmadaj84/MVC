@@ -1,0 +1,8 @@
+{
+  "name": "نظام إدارة قرارات المخالفات الصحية والمهنية (MVC)",
+  "description": "منظومة إلكترونية متكاملة لإدارة وتوثيق قرارات المخالفات للمنشآت والممارسين الصحيين مع تتبع الرسائل النصية والتحصيل ونظام سهل حسب هيكل MVC_DB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
