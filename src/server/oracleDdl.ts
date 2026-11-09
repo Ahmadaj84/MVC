@@ -240,10 +240,15 @@ import oracledb from 'oracledb';
 oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
 oracledb.autoCommit = true;
 
+// Credentials MUST come from the environment / a secrets manager - never hardcode defaults.
+for (const key of ['ORACLE_USER', 'ORACLE_PASSWORD', 'ORACLE_CONNECT_STRING']) {
+  if (!process.env[key]) throw new Error(\`Missing required environment variable \${key}\`);
+}
+
 const oracleConfig = {
-  user: process.env.ORACLE_USER || 'MVC_ADMIN',
-  password: process.env.ORACLE_PASSWORD || 'Secret#2026',
-  connectString: process.env.ORACLE_CONNECT_STRING || '192.168.1.100:1521/ORCLPDB1', // Oracle 19c PDB/SID
+  user: process.env.ORACLE_USER,
+  password: process.env.ORACLE_PASSWORD,
+  connectString: process.env.ORACLE_CONNECT_STRING, // e.g. host:1521/SERVICE_NAME
   poolMin: 2,
   poolMax: 10,
   poolIncrement: 2

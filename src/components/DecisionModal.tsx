@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   MvcVpiFacility,
   MvcMstaffData,
@@ -27,17 +27,20 @@ interface ItemRow {
   PENALTY_NAME: string;
 }
 
-export const DecisionModal: React.FC<DecisionModalProps> = ({
+// Wrapper keeps the early return outside the component that uses hooks
+// (calling hooks after a conditional return breaks React's rules of hooks).
+export const DecisionModal: React.FC<DecisionModalProps> = props =>
+  props.isOpen ? <DecisionModalContent {...props} /> : null;
+
+const DecisionModalContent: React.FC<DecisionModalProps> = ({
   type,
   initialDecision,
   facilities,
   staffList,
   articles,
-  isOpen,
   onClose,
   onSubmit
 }) => {
-  if (!isOpen) return null;
 
   const isEditing = Boolean(initialDecision);
 
@@ -125,8 +128,14 @@ export const DecisionModal: React.FC<DecisionModalProps> = ({
 
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Update Hijri date whenever Gregorian changes
+  // Update Hijri date whenever the user changes the Gregorian date.
+  // Skip the initial render so an existing decision keeps its stored Hijri date.
+  const isFirstDateRender = useRef(true);
   useEffect(() => {
+    if (isFirstDateRender.current) {
+      isFirstDateRender.current = false;
+      return;
+    }
     if (dateG) {
       setDateH(toHijriDate(dateG));
     }
@@ -214,7 +223,7 @@ export const DecisionModal: React.FC<DecisionModalProps> = ({
       onClose();
     } catch (err) {
       console.error(err);
-      alert('حدث خطأ أثناء حفظ القرار');
+      alert(`حدث خطأ أثناء حفظ القرار: ${(err as Error)?.message || ''}`);
     } finally {
       setIsSubmitting(false);
     }

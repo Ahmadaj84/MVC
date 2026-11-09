@@ -1,30 +1,197 @@
 import express from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { db } from './src/server/db';
 import { ORACLE_19C_DDL, ORACLE_19C_NODE_CONNECTOR } from './src/server/oracleDdl';
+import { createBasicAuth, rateLimit, securityHeaders } from './src/server/security';
+import {
+  ValidationError,
+  assertRequired,
+  assertStrings,
+  matches,
+  pick,
+  toAmount,
+  toId
+} from './src/server/validation';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const today = () => new Date().toISOString().split('T')[0];
+
+// ==========================================
+// FIELD WHITELISTS (prevent mass assignment)
+// IDs, CREATE_DATE / UPDATE_DATE and PAYED are always server-controlled.
+// ==========================================
+const FACILITY_FIELDS = [
+  'FACILITY_NAME', 'FACILITY_TYPE', 'LICENSE_NUMBER', 'MOBILE', 'EMAIL', 'ADD_UNIT', 'UPDATE_BY',
+  'ADD_STREET', 'ADD_BUILD_NO', 'ADD_BUILD_NO2', 'ADD_DIST', 'ADD_CITY', 'ADD_POSTCODE',
+  'LICENSE_DATE', 'COM_LICENSE_NO', 'COM_START_DATE', 'COM_END_DATE', 'FILE_NAME', 'CR_NO', 'PRV_GOV'
+] as const;
+const FACILITY_STRING_FIELDS = FACILITY_FIELDS.filter(f => f !== 'FACILITY_TYPE');
+const FACILITY_REQUIRED = ['FACILITY_NAME', 'LICENSE_NUMBER', 'CR_NO', 'MOBILE'] as const;
+
+const STAFF_FIELDS = [
+  'FULL_NAME', 'NATIONAL_ID', 'JOB_LOCATION', 'TYPE_JOB_LOC', 'MOBIE_NUM', 'UPDATE_BY', 'EMAIL',
+  'ADD_UNIT', 'ADD_STREET', 'ADD_BUILD_NO', 'ADD_BUILD_NO2', 'ADD_DIST', 'ADD_CITY', 'ADD_POSTCODE',
+  'FILE_NAME', 'NATIONALITY', 'GENDR', 'DEGREE', 'LIS_END_DATE', 'VAC_DATE', 'FACILILTY_SERIAL'
+] as const;
+const STAFF_STRING_FIELDS = STAFF_FIELDS.filter(f => f !== 'FACILILTY_SERIAL');
+const STAFF_REQUIRED = ['FULL_NAME', 'NATIONAL_ID', 'MOBIE_NUM'] as const;
+
+const ARTICLE_FIELDS = ['ARTICAL_NAME', 'ARTICAL_DISCRIPTION', 'ARTICAL_TYPE'] as const;
+const ARTICLE_TYPES = ['منشآت', 'ممارسين', 'مشترك'];
+
+const FAC_DECISION_FIELDS = [
+  'DECISION_DATE_G', 'DECISION_DATE_H', 'INTERNAL_REF_SAHL', 'SAHL_DATE', 'FACILITIE_ID',
+  'DEPARTMENT', 'NEED_SMS', 'DECISION_ID', 'FILE_NAME'
+] as const;
+const STAFF_DECISION_FIELDS = [
+  'DECISION_DATE_G', 'DECISION_DATE_H', 'INTERNAL_REF_SAHL', 'SAHL_DATE', 'MSTAFF_ID',
+  'DEC_SOURCE', 'NEED_SMS', 'DECISION_ID', 'FILE_NAME'
+] as const;
+const DECISION_STRING_FIELDS = [
+  'DECISION_DATE_G', 'DECISION_DATE_H', 'INTERNAL_REF_SAHL', 'SAHL_DATE', 'DEPARTMENT',
+  'DEC_SOURCE', 'DECISION_ID', 'FILE_NAME', 'CREATE_BY'
+] as const;
+
+// ==========================================
+// VALIDATORS
+// ==========================================
+function validateFacility(data: Record<string, unknown>, isCreate: boolean) {
+  assertStrings(data, [...FACILITY_STRING_FIELDS, 'CREATE_BY']);
+  if (isCreate) assertRequired(data, FACILITY_REQUIRED);
+  else for (const k of FACILITY_REQUIRED) if (k in data) assertRequired(data, [k]);
+  if (data.FACILITY_TYPE !== undefined || isCreate) {
+    const typeId = toId(data.FACILITY_TYPE, 'FACILITY_TYPE');
+    if (!db.facilityTypes.some(t => t.FACILITY_TYPE_SN === typeId)) {
+      throw new ValidationError('FACILITY_TYPE does not exist');
+    }
+    data.FACILITY_TYPE = typeId;
+  }
+}
+
+function validateStaff(data: Record<string, unknown>, isCreate: boolean) {
+  assertStrings(data, [...STAFF_STRING_FIELDS, 'CREATE_BY']);
+  if (isCreate) assertRequired(data, STAFF_REQUIRED);
+  else for (const k of STAFF_REQUIRED) if (k in data) assertRequired(data, [k]);
+  if (data.FACILILTY_SERIAL !== undefined && data.FACILILTY_SERIAL !== null && data.FACILILTY_SERIAL !== '') {
+    const facId = toId(data.FACILILTY_SERIAL, 'FACILILTY_SERIAL');
+    if (!db.facilities.some(f => f.FACILITY_SERIAL === facId)) {
+      throw new ValidationError('FACILILTY_SERIAL does not exist');
+    }
+    data.FACILILTY_SERIAL = facId;
+  }
+}
+
+function validateArticle(data: Record<string, unknown>, isCreate: boolean) {
+  assertStrings(data, ARTICLE_FIELDS);
+  if (isCreate || 'ARTICAL_NAME' in data) assertRequired(data, ['ARTICAL_NAME']);
+  if ((isCreate || 'ARTICAL_TYPE' in data) && !ARTICLE_TYPES.includes(String(data.ARTICAL_TYPE))) {
+    throw new ValidationError(`ARTICAL_TYPE must be one of: ${ARTICLE_TYPES.join(', ')}`);
+  }
+}
+
+function validateDecisionFields(data: Record<string, unknown>) {
+  assertStrings(data, DECISION_STRING_FIELDS);
+  for (const k of ['DECISION_ID', 'INTERNAL_REF_SAHL', 'DEPARTMENT', 'DEC_SOURCE']) {
+    if (k in data) assertRequired(data, [k]);
+  }
+  if (data.NEED_SMS !== undefined) {
+    data.NEED_SMS = Number(data.NEED_SMS) ? 1 : 0;
+  }
+}
+
+interface ParsedItem {
+  ARTICAL_ID: number;
+  AMOUNT: number;
+  PENALTY_TYP: string;
+  PENALTY_NAME: string;
+}
+
+function parseItems(items: unknown, defaultName: string): ParsedItem[] {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new ValidationError('At least one penalty item is required');
+  }
+  if (items.length > 100) throw new ValidationError('Too many penalty items');
+  return items.map((raw, idx) => {
+    const item = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+    const articleId = toId(item.ARTICAL_ID, `items[${idx}].ARTICAL_ID`);
+    if (!db.articles.some(a => a.ARTICAL_ID === articleId)) {
+      throw new ValidationError(`items[${idx}].ARTICAL_ID does not exist`);
+    }
+    assertStrings(item, ['PENALTY_TYP', 'PENALTY_NAME']);
+    return {
+      ARTICAL_ID: articleId,
+      AMOUNT: toAmount(item.AMOUNT ?? 0, `items[${idx}].AMOUNT`),
+      PENALTY_TYP: (item.PENALTY_TYP as string) || 'غرامة مالية',
+      PENALTY_NAME: (item.PENALTY_NAME as string) || defaultName
+    };
+  });
+}
+
+/** Validates a payment against the decision's remaining balance. */
+function parsePayment(
+  body: Record<string, unknown>,
+  remaining: number,
+  validItemIds: number[],
+  itemKey: 'PEN_DES_FAC_ID' | 'PEN_DES_MSTAFF_ID'
+) {
+  const amount = toAmount(body.RECEIPT_AMOUNT, 'RECEIPT_AMOUNT', { allowZero: false });
+  if (remaining <= 0) {
+    throw new ValidationError('This decision is already fully paid', 409);
+  }
+  if (amount > remaining + 0.005) {
+    throw new ValidationError(`RECEIPT_AMOUNT exceeds the remaining balance (${remaining})`);
+  }
+  assertStrings(body, ['RECEIPT_DATE', 'RECIPT_ID', 'CREATED_BY', 'FILE_NAME']);
+  let itemId: number | undefined;
+  const rawItem = body[itemKey];
+  if (rawItem !== undefined && rawItem !== null && rawItem !== '') {
+    itemId = toId(rawItem, itemKey);
+    if (!validItemIds.includes(itemId)) {
+      throw new ValidationError(`${itemKey} does not belong to this decision`);
+    }
+  }
+  return { amount, itemId };
+}
+
+function parseSmsRequest(body: Record<string, unknown>) {
+  const noticeNum = Number(body.noticeNum) === 2 ? 2 : 1;
+  const customText = body.customText;
+  if (customText !== undefined && customText !== null && (typeof customText !== 'string' || customText.length > 1000)) {
+    throw new ValidationError('customText must be a string of at most 1000 characters');
+  }
+  return { noticeNum, customText: (customText as string | undefined) || undefined };
+}
+
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+  const isProduction = process.env.NODE_ENV === 'production';
+  const HOST = process.env.HOST || '0.0.0.0';
 
-  app.use(express.json());
+  app.disable('x-powered-by');
+  app.use(securityHeaders);
+
+  // 1. Health check (unauthenticated, exposes nothing sensitive)
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      database: 'In-memory store (Oracle 19c schema)',
+      time: new Date().toISOString()
+    });
+  });
+
+  // Everything else (UI + API) requires authentication.
+  app.use(createBasicAuth(isProduction));
+  app.use('/api', rateLimit(120, 60_000));
+  app.use(express.json({ limit: '100kb' }));
 
   // ==========================================
   // API ROUTES
   // ==========================================
-
-  // 1. Health check
-  app.get('/api/health', (_req, res) => {
-    res.json({
-      status: 'ok',
-      database: 'Oracle Database 19c (Enterprise Edition)',
-      time: new Date().toISOString()
-    });
-  });
 
   // 1.1 Oracle 19c DDL and Architecture API
   app.get('/api/oracle/ddl', (_req, res) => {
@@ -51,11 +218,11 @@ async function startServer() {
     const totalPaid = paidFacFines + paidStaffFines;
     const totalRemaining = totalFines - totalPaid;
 
-    const uncollectedDecisionsCount = 
-      facDecisions.filter(d => d.PAYED !== 2).length + 
+    const uncollectedDecisionsCount =
+      facDecisions.filter(d => d.PAYED !== 2).length +
       staffDecisions.filter(d => d.PAYED !== 2).length;
 
-    const totalSmsSent = 
+    const totalSmsSent =
       db.facSms.filter(s => s.NOTC_1_STATUS === 'تم الإرسال').length +
       db.facSms.filter(s => s.NOTC_2_STATUS === 'تم الإرسال').length +
       db.staffSms.filter(s => s.NOTC_1_STATUS === 'تم الإرسال').length +
@@ -83,14 +250,12 @@ async function startServer() {
   });
 
   app.post('/api/facility-types', (req, res) => {
-    const { FACILITY_TYPE_DESC } = req.body;
-    if (!FACILITY_TYPE_DESC) {
-      return res.status(400).json({ error: 'FACILITY_TYPE_DESC is required' });
-    }
-    const maxSn = db.facilityTypes.reduce((max, t) => Math.max(max, t.FACILITY_TYPE_SN), 0);
+    const data = pick(req.body, ['FACILITY_TYPE_DESC'] as const);
+    assertStrings(data, ['FACILITY_TYPE_DESC']);
+    assertRequired(data, ['FACILITY_TYPE_DESC']);
     const newType = {
-      FACILITY_TYPE_SN: maxSn + 1,
-      FACILITY_TYPE_DESC
+      FACILITY_TYPE_SN: db.nextId('facilityType'),
+      FACILITY_TYPE_DESC: data.FACILITY_TYPE_DESC as string
     };
     db.facilityTypes.push(newType);
     res.status(201).json(newType);
@@ -107,11 +272,11 @@ async function startServer() {
 
     if (search) {
       const q = String(search).toLowerCase();
-      list = list.filter(f => 
-        f.FACILITY_NAME.toLowerCase().includes(q) ||
-        f.LICENSE_NUMBER.toLowerCase().includes(q) ||
-        f.CR_NO.toLowerCase().includes(q) ||
-        f.MOBILE.includes(q)
+      list = list.filter(f =>
+        matches(f.FACILITY_NAME, q) ||
+        matches(f.LICENSE_NUMBER, q) ||
+        matches(f.CR_NO, q) ||
+        matches(f.MOBILE, q)
       );
     }
 
@@ -127,35 +292,47 @@ async function startServer() {
   });
 
   app.post('/api/facilities', (req, res) => {
-    const data = req.body;
-    const maxId = db.facilities.reduce((max, f) => Math.max(max, f.FACILITY_SERIAL), 100);
+    const data: Record<string, unknown> = pick(req.body, [...FACILITY_FIELDS, 'CREATE_BY'] as const);
+    validateFacility(data, true);
     const newFacility = {
       ...data,
-      FACILITY_SERIAL: maxId + 1,
-      CREATE_DATE: new Date().toISOString().split('T')[0],
-      CREATE_BY: data.CREATE_BY || 'النظام'
-    };
+      FACILITY_SERIAL: db.nextId('facility'),
+      CREATE_DATE: today(),
+      CREATE_BY: (data.CREATE_BY as string) || 'النظام'
+    } as (typeof db.facilities)[number];
     db.facilities.unshift(newFacility);
     res.status(201).json(newFacility);
   });
 
   app.put('/api/facilities/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
     const index = db.facilities.findIndex(f => f.FACILITY_SERIAL === id);
     if (index === -1) {
       return res.status(404).json({ error: 'Facility not found' });
     }
+    const data: Record<string, unknown> = pick(req.body, FACILITY_FIELDS);
+    validateFacility(data, false);
     db.facilities[index] = {
       ...db.facilities[index],
-      ...req.body,
+      ...data,
       FACILITY_SERIAL: id,
-      UPDATE_DATE: new Date().toISOString().split('T')[0]
+      UPDATE_DATE: today()
     };
     res.json(db.facilities[index]);
   });
 
   app.delete('/api/facilities/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
+    if (!db.facilities.some(f => f.FACILITY_SERIAL === id)) {
+      return res.status(404).json({ error: 'Facility not found' });
+    }
+    const decisions = db.facDecisions.filter(d => d.FACILITIE_ID === id).length;
+    const staff = db.staff.filter(s => s.FACILILTY_SERIAL === id).length;
+    if (decisions > 0 || staff > 0) {
+      return res.status(409).json({
+        error: `Cannot delete facility: it is referenced by ${decisions} decision(s) and ${staff} staff member(s)`
+      });
+    }
     db.facilities = db.facilities.filter(f => f.FACILITY_SERIAL !== id);
     res.json({ success: true });
   });
@@ -172,9 +349,9 @@ async function startServer() {
     if (search) {
       const q = String(search).toLowerCase();
       list = list.filter(s =>
-        s.FULL_NAME.toLowerCase().includes(q) ||
-        s.NATIONAL_ID.includes(q) ||
-        s.MOBIE_NUM.includes(q)
+        matches(s.FULL_NAME, q) ||
+        matches(s.NATIONAL_ID, q) ||
+        matches(s.MOBIE_NUM, q)
       );
     }
 
@@ -190,35 +367,46 @@ async function startServer() {
   });
 
   app.post('/api/staff', (req, res) => {
-    const data = req.body;
-    const maxId = db.staff.reduce((max, s) => Math.max(max, s.STAFF_SERIAL), 200);
+    const data: Record<string, unknown> = pick(req.body, [...STAFF_FIELDS, 'CREATE_BY'] as const);
+    validateStaff(data, true);
     const newStaff = {
       ...data,
-      STAFF_SERIAL: maxId + 1,
-      CREATE_DATE: new Date().toISOString().split('T')[0],
-      CREATE_BY: data.CREATE_BY || 'النظام'
-    };
+      STAFF_SERIAL: db.nextId('staff'),
+      CREATE_DATE: today(),
+      CREATE_BY: (data.CREATE_BY as string) || 'النظام'
+    } as (typeof db.staff)[number];
     db.staff.unshift(newStaff);
     res.status(201).json(newStaff);
   });
 
   app.put('/api/staff/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
     const index = db.staff.findIndex(s => s.STAFF_SERIAL === id);
     if (index === -1) {
       return res.status(404).json({ error: 'Staff member not found' });
     }
+    const data: Record<string, unknown> = pick(req.body, STAFF_FIELDS);
+    validateStaff(data, false);
     db.staff[index] = {
       ...db.staff[index],
-      ...req.body,
+      ...data,
       STAFF_SERIAL: id,
-      UPDATE_DATE: new Date().toISOString().split('T')[0]
+      UPDATE_DATE: today()
     };
     res.json(db.staff[index]);
   });
 
   app.delete('/api/staff/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
+    if (!db.staff.some(s => s.STAFF_SERIAL === id)) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+    const decisions = db.staffDecisions.filter(d => d.MSTAFF_ID === id).length;
+    if (decisions > 0) {
+      return res.status(409).json({
+        error: `Cannot delete staff member: it is referenced by ${decisions} decision(s)`
+      });
+    }
     db.staff = db.staff.filter(s => s.STAFF_SERIAL !== id);
     res.json({ success: true });
   });
@@ -229,28 +417,42 @@ async function startServer() {
   });
 
   app.post('/api/penalty-articles', (req, res) => {
-    const data = req.body;
-    const maxId = db.articles.reduce((max, a) => Math.max(max, a.ARTICAL_ID), 0);
+    const data: Record<string, unknown> = pick(req.body, ARTICLE_FIELDS);
+    validateArticle(data, true);
     const newArt = {
+      ARTICAL_DISCRIPTION: '',
       ...data,
-      ARTICAL_ID: maxId + 1
-    };
+      ARTICAL_ID: db.nextId('article')
+    } as (typeof db.articles)[number];
     db.articles.push(newArt);
     res.status(201).json(newArt);
   });
 
   app.put('/api/penalty-articles/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
     const index = db.articles.findIndex(a => a.ARTICAL_ID === id);
     if (index === -1) {
       return res.status(404).json({ error: 'Article not found' });
     }
-    db.articles[index] = { ...db.articles[index], ...req.body, ARTICAL_ID: id };
+    const data: Record<string, unknown> = pick(req.body, ARTICLE_FIELDS);
+    validateArticle(data, false);
+    db.articles[index] = { ...db.articles[index], ...data, ARTICAL_ID: id };
     res.json(db.articles[index]);
   });
 
   app.delete('/api/penalty-articles/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
+    if (!db.articles.some(a => a.ARTICAL_ID === id)) {
+      return res.status(404).json({ error: 'Article not found' });
+    }
+    const uses =
+      db.penaltyDesFac.filter(i => i.ARTICAL_ID === id).length +
+      db.penaltyDesStaff.filter(i => i.ARTICAL_ID === id).length;
+    if (uses > 0) {
+      return res.status(409).json({
+        error: `Cannot delete article: it is used by ${uses} penalty item(s)`
+      });
+    }
     db.articles = db.articles.filter(a => a.ARTICAL_ID !== id);
     res.json({ success: true });
   });
@@ -271,10 +473,10 @@ async function startServer() {
     if (search) {
       const q = String(search).toLowerCase();
       list = list.filter(d =>
-        d.DECISION_ID.toLowerCase().includes(q) ||
-        d.INTERNAL_REF_SAHL.toLowerCase().includes(q) ||
-        d.facility?.FACILITY_NAME.toLowerCase().includes(q) ||
-        d.DEPARTMENT.toLowerCase().includes(q)
+        matches(d.DECISION_ID, q) ||
+        matches(d.INTERNAL_REF_SAHL, q) ||
+        matches(d.facility?.FACILITY_NAME, q) ||
+        matches(d.DEPARTMENT, q)
       );
     }
 
@@ -282,7 +484,7 @@ async function startServer() {
   });
 
   app.get('/api/facility-decisions/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
     const decision = db.getFullFacDecisions().find(d => d.DECISION_FAC_ID === id);
     if (!decision) {
       return res.status(404).json({ error: 'Decision not found' });
@@ -291,48 +493,36 @@ async function startServer() {
   });
 
   app.post('/api/facility-decisions', (req, res) => {
-    const { decision, items, sendSmsNow } = req.body;
-    if (!decision || !decision.FACILITIE_ID) {
-      return res.status(400).json({ error: 'Facility and Decision details are required' });
+    const decision: Record<string, unknown> = pick(req.body?.decision, [...FAC_DECISION_FIELDS, 'CREATE_BY'] as const);
+    validateDecisionFields(decision);
+    const facilityId = toId(decision.FACILITIE_ID, 'FACILITIE_ID');
+    if (!db.facilities.some(f => f.FACILITY_SERIAL === facilityId)) {
+      return res.status(400).json({ error: 'FACILITIE_ID does not exist' });
     }
+    const items = parseItems(req.body?.items, 'مخالفة نظام المؤسسات الصحية');
 
-    const maxId = db.facDecisions.reduce((max, d) => Math.max(max, d.DECISION_FAC_ID), 1000);
-    const newDecId = maxId + 1;
-
-    const facility = db.facilities.find(f => f.FACILITY_SERIAL === Number(decision.FACILITIE_ID));
-
+    const newDecId = db.nextId('facDecision');
     const newDecision = {
       DECISION_FAC_ID: newDecId,
-      DECISION_DATE_G: decision.DECISION_DATE_G || new Date().toISOString().split('T')[0],
-      DECISION_DATE_H: decision.DECISION_DATE_H || '1447-01-01',
-      INTERNAL_REF_SAHL: decision.INTERNAL_REF_SAHL || `SHL-${Date.now().toString().slice(-6)}`,
-      SAHL_DATE: decision.SAHL_DATE || new Date().toISOString().split('T')[0],
-      FACILITIE_ID: Number(decision.FACILITIE_ID),
-      DEPARTMENT: decision.DEPARTMENT || 'لجنة النظر في مخالفات المؤسسات الصحية الخاصة',
-      CREATE_BY: decision.CREATE_BY || 'أمين سر اللجنة',
-      NEED_SMS: decision.NEED_SMS !== undefined ? Number(decision.NEED_SMS) : 1,
+      DECISION_DATE_G: (decision.DECISION_DATE_G as string) || today(),
+      DECISION_DATE_H: (decision.DECISION_DATE_H as string) || '1447-01-01',
+      INTERNAL_REF_SAHL: (decision.INTERNAL_REF_SAHL as string) || `SHL-${Date.now().toString().slice(-6)}`,
+      SAHL_DATE: (decision.SAHL_DATE as string) || today(),
+      FACILITIE_ID: facilityId,
+      DEPARTMENT: (decision.DEPARTMENT as string) || 'لجنة النظر في مخالفات المؤسسات الصحية الخاصة',
+      CREATE_BY: (decision.CREATE_BY as string) || 'أمين سر اللجنة',
+      NEED_SMS: decision.NEED_SMS !== undefined ? (decision.NEED_SMS as number) : 1,
       PAYED: 0,
-      DECISION_ID: decision.DECISION_ID || `ق-م/1447/${newDecId}`,
-      CREATED_DATE: new Date().toISOString().split('T')[0],
-      FILE_NAME: decision.FILE_NAME || `decision_fac_${newDecId}.pdf`
+      DECISION_ID: (decision.DECISION_ID as string) || `ق-م/1447/${newDecId}`,
+      CREATED_DATE: today(),
+      FILE_NAME: (decision.FILE_NAME as string) || `decision_fac_${newDecId}.pdf`
     };
 
     db.facDecisions.unshift(newDecision);
 
     // Save items (MVC_PENALTY_DES_FAC)
-    let maxItemId = db.penaltyDesFac.reduce((max, i) => Math.max(max, i.PEN_DES_FAC_ID), 5000);
-    if (Array.isArray(items) && items.length > 0) {
-      for (const item of items) {
-        maxItemId++;
-        db.penaltyDesFac.push({
-          PEN_DES_FAC_ID: maxItemId,
-          DECISION_ID: newDecId,
-          ARTICAL_ID: Number(item.ARTICAL_ID),
-          AMOUNT: Number(item.AMOUNT) || 0,
-          PENALTY_TYP: item.PENALTY_TYP || 'غرامة مالية',
-          PENALTY_NAME: item.PENALTY_NAME || 'مخالفة نظام المؤسسات الصحية'
-        });
-      }
+    for (const item of items) {
+      db.penaltyDesFac.push({ PEN_DES_FAC_ID: db.nextId('penaltyDesFac'), DECISION_ID: newDecId, ...item });
     }
 
     // MVC_FAC_SMS: In Oracle 19c, SMS records are preserved for historical audit only.
@@ -342,12 +532,21 @@ async function startServer() {
   });
 
   app.put('/api/facility-decisions/:id', (req, res) => {
-    const id = Number(req.params.id);
-    const { decision, items } = req.body;
+    const id = toId(req.params.id, 'id');
     const index = db.facDecisions.findIndex(d => d.DECISION_FAC_ID === id);
     if (index === -1) {
       return res.status(404).json({ error: 'Decision not found' });
     }
+    const decision: Record<string, unknown> = pick(req.body?.decision, FAC_DECISION_FIELDS);
+    validateDecisionFields(decision);
+    if (decision.FACILITIE_ID !== undefined) {
+      const facilityId = toId(decision.FACILITIE_ID, 'FACILITIE_ID');
+      if (!db.facilities.some(f => f.FACILITY_SERIAL === facilityId)) {
+        return res.status(400).json({ error: 'FACILITIE_ID does not exist' });
+      }
+      decision.FACILITIE_ID = facilityId;
+    }
+    const items = req.body?.items !== undefined ? parseItems(req.body.items, 'مخالفة') : undefined;
 
     db.facDecisions[index] = {
       ...db.facDecisions[index],
@@ -355,20 +554,14 @@ async function startServer() {
       DECISION_FAC_ID: id
     };
 
-    if (Array.isArray(items)) {
-      // Replace items
+    if (items) {
+      // Replace items. Payments that were allocated to a removed item lose that allocation.
       db.penaltyDesFac = db.penaltyDesFac.filter(i => i.DECISION_ID !== id);
-      let maxItemId = db.penaltyDesFac.reduce((max, i) => Math.max(max, i.PEN_DES_FAC_ID), 5000);
       for (const item of items) {
-        maxItemId++;
-        db.penaltyDesFac.push({
-          PEN_DES_FAC_ID: maxItemId,
-          DECISION_ID: id,
-          ARTICAL_ID: Number(item.ARTICAL_ID),
-          AMOUNT: Number(item.AMOUNT) || 0,
-          PENALTY_TYP: item.PENALTY_TYP || 'غرامة مالية',
-          PENALTY_NAME: item.PENALTY_NAME || 'مخالفة'
-        });
+        db.penaltyDesFac.push({ PEN_DES_FAC_ID: db.nextId('penaltyDesFac'), DECISION_ID: id, ...item });
+      }
+      for (const p of db.paymentFac) {
+        if (p.DECISION_ID === id) p.PEN_DES_FAC_ID = undefined;
       }
     }
 
@@ -378,7 +571,10 @@ async function startServer() {
   });
 
   app.delete('/api/facility-decisions/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
+    if (!db.facDecisions.some(d => d.DECISION_FAC_ID === id)) {
+      return res.status(404).json({ error: 'Decision not found' });
+    }
     db.facDecisions = db.facDecisions.filter(d => d.DECISION_FAC_ID !== id);
     db.penaltyDesFac = db.penaltyDesFac.filter(i => i.DECISION_ID !== id);
     db.facSms = db.facSms.filter(s => s.DECISION_FAC_ID !== id);
@@ -388,18 +584,17 @@ async function startServer() {
 
   // Trigger SMS for Facility Decision (Notice 1 or Notice 2)
   app.post('/api/facility-decisions/:id/send-sms', (req, res) => {
-    const id = Number(req.params.id);
-    const { noticeNum, customText } = req.body; // 1 or 2
-    let sms = db.facSms.find(s => s.DECISION_FAC_ID === id);
+    const id = toId(req.params.id, 'id');
+    const { noticeNum, customText } = parseSmsRequest(req.body || {});
     const decision = db.getFullFacDecisions().find(d => d.DECISION_FAC_ID === id);
     if (!decision) {
       return res.status(404).json({ error: 'Decision not found' });
     }
+    let sms = db.facSms.find(s => s.DECISION_FAC_ID === id);
 
     if (!sms) {
-      const maxSmsId = db.facSms.reduce((max, s) => Math.max(max, s.SMS_ID), 7000);
       sms = {
-        SMS_ID: maxSmsId + 1,
+        SMS_ID: db.nextId('facSms'),
         DECISION_FAC_ID: id,
         MOBILE: decision.facility?.MOBILE || '0500000000',
         NOTC_1_STATUS: 'قيد المعالجة',
@@ -441,24 +636,30 @@ async function startServer() {
 
   // Register Payment for Facility Decision (MVC_PAYMENT_FAC)
   app.post('/api/facility-decisions/:id/payments', (req, res) => {
-    const id = Number(req.params.id);
-    const { RECEIPT_AMOUNT, RECEIPT_DATE, RECIPT_ID, CREATED_BY, PEN_DES_FAC_ID, FILE_NAME } = req.body;
-
-    if (!RECEIPT_AMOUNT || Number(RECEIPT_AMOUNT) <= 0) {
-      return res.status(400).json({ error: 'Valid receipt amount is required' });
+    const id = toId(req.params.id, 'id');
+    const decision = db.getFullFacDecisions().find(d => d.DECISION_FAC_ID === id);
+    if (!decision) {
+      return res.status(404).json({ error: 'Decision not found' });
     }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const { amount, itemId } = parsePayment(
+      body,
+      decision.totalAmount - decision.paidAmount,
+      decision.items.map(i => i.PEN_DES_FAC_ID),
+      'PEN_DES_FAC_ID'
+    );
 
-    const maxPayId = db.paymentFac.reduce((max, p) => Math.max(max, p.PAYMENT_ID), 9000);
+    const paymentId = db.nextId('paymentFac');
     const newPayment = {
-      PAYMENT_ID: maxPayId + 1,
-      RECEIPT_DATE: RECEIPT_DATE || new Date().toISOString().split('T')[0],
-      RECEIPT_AMOUNT: Number(RECEIPT_AMOUNT),
+      PAYMENT_ID: paymentId,
+      RECEIPT_DATE: (body.RECEIPT_DATE as string) || today(),
+      RECEIPT_AMOUNT: amount,
       DECISION_ID: id,
-      PEN_DES_FAC_ID: PEN_DES_FAC_ID ? Number(PEN_DES_FAC_ID) : undefined,
-      CREATED_DATE: new Date().toISOString().split('T')[0],
-      CREATED_BY: CREATED_BY || 'أمين الصندوق',
-      RECIPT_ID: RECIPT_ID || `REC-SADAD-${Date.now().toString().slice(-6)}`,
-      FILE_NAME: FILE_NAME || `receipt_${maxPayId + 1}.pdf`
+      PEN_DES_FAC_ID: itemId,
+      CREATED_DATE: today(),
+      CREATED_BY: (body.CREATED_BY as string) || 'أمين الصندوق',
+      RECIPT_ID: (body.RECIPT_ID as string) || `REC-SADAD-${Date.now().toString().slice(-6)}`,
+      FILE_NAME: (body.FILE_NAME as string) || `receipt_${paymentId}.pdf`
     };
 
     db.paymentFac.push(newPayment);
@@ -484,10 +685,10 @@ async function startServer() {
     if (search) {
       const q = String(search).toLowerCase();
       list = list.filter(d =>
-        d.DECISION_ID.toLowerCase().includes(q) ||
-        d.INTERNAL_REF_SAHL.toLowerCase().includes(q) ||
-        d.staff?.FULL_NAME.toLowerCase().includes(q) ||
-        d.DEC_SOURCE.toLowerCase().includes(q)
+        matches(d.DECISION_ID, q) ||
+        matches(d.INTERNAL_REF_SAHL, q) ||
+        matches(d.staff?.FULL_NAME, q) ||
+        matches(d.DEC_SOURCE, q)
       );
     }
 
@@ -495,7 +696,7 @@ async function startServer() {
   });
 
   app.get('/api/staff-decisions/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
     const decision = db.getFullStaffDecisions().find(d => d.DECISION_MSTAFF_ID === id);
     if (!decision) {
       return res.status(404).json({ error: 'Staff decision not found' });
@@ -504,48 +705,36 @@ async function startServer() {
   });
 
   app.post('/api/staff-decisions', (req, res) => {
-    const { decision, items, sendSmsNow } = req.body;
-    if (!decision || !decision.MSTAFF_ID) {
-      return res.status(400).json({ error: 'Medical staff and decision details are required' });
+    const decision: Record<string, unknown> = pick(req.body?.decision, [...STAFF_DECISION_FIELDS, 'CREATE_BY'] as const);
+    validateDecisionFields(decision);
+    const staffId = toId(decision.MSTAFF_ID, 'MSTAFF_ID');
+    if (!db.staff.some(s => s.STAFF_SERIAL === staffId)) {
+      return res.status(400).json({ error: 'MSTAFF_ID does not exist' });
     }
+    const items = parseItems(req.body?.items, 'مخالفة مزاولة المهن الصحية');
 
-    const maxId = db.staffDecisions.reduce((max, d) => Math.max(max, d.DECISION_MSTAFF_ID), 2000);
-    const newDecId = maxId + 1;
-
-    const staffMember = db.staff.find(s => s.STAFF_SERIAL === Number(decision.MSTAFF_ID));
-
+    const newDecId = db.nextId('staffDecision');
     const newDecision = {
       DECISION_MSTAFF_ID: newDecId,
-      DECISION_DATE_G: decision.DECISION_DATE_G || new Date().toISOString().split('T')[0],
-      DECISION_DATE_H: decision.DECISION_DATE_H || '1447-01-01',
-      INTERNAL_REF_SAHL: decision.INTERNAL_REF_SAHL || `SHL-STF-${Date.now().toString().slice(-6)}`,
-      SAHL_DATE: decision.SAHL_DATE || new Date().toISOString().split('T')[0],
-      MSTAFF_ID: Number(decision.MSTAFF_ID),
-      DEC_SOURCE: decision.DEC_SOURCE || 'لجنة مخالفات نظام مزاولة المهن الصحية',
-      CREATE_BY: decision.CREATE_BY || 'أمين سر اللجنة',
-      NEED_SMS: decision.NEED_SMS !== undefined ? Number(decision.NEED_SMS) : 1,
+      DECISION_DATE_G: (decision.DECISION_DATE_G as string) || today(),
+      DECISION_DATE_H: (decision.DECISION_DATE_H as string) || '1447-01-01',
+      INTERNAL_REF_SAHL: (decision.INTERNAL_REF_SAHL as string) || `SHL-STF-${Date.now().toString().slice(-6)}`,
+      SAHL_DATE: (decision.SAHL_DATE as string) || today(),
+      MSTAFF_ID: staffId,
+      DEC_SOURCE: (decision.DEC_SOURCE as string) || 'لجنة مخالفات نظام مزاولة المهن الصحية',
+      CREATE_BY: (decision.CREATE_BY as string) || 'أمين سر اللجنة',
+      NEED_SMS: decision.NEED_SMS !== undefined ? (decision.NEED_SMS as number) : 1,
       PAYED: 0,
-      DECISION_ID: decision.DECISION_ID || `ق-ص/1447/${newDecId}`,
-      CREATED_DATE: new Date().toISOString().split('T')[0],
-      FILE_NAME: decision.FILE_NAME || `decision_staff_${newDecId}.pdf`
+      DECISION_ID: (decision.DECISION_ID as string) || `ق-ص/1447/${newDecId}`,
+      CREATED_DATE: today(),
+      FILE_NAME: (decision.FILE_NAME as string) || `decision_staff_${newDecId}.pdf`
     };
 
     db.staffDecisions.unshift(newDecision);
 
     // Save items (MVC_PENALTY_DES_MSTAFF)
-    let maxItemId = db.penaltyDesStaff.reduce((max, i) => Math.max(max, i.PEN_DES_MSTAFF_ID), 6000);
-    if (Array.isArray(items) && items.length > 0) {
-      for (const item of items) {
-        maxItemId++;
-        db.penaltyDesStaff.push({
-          PEN_DES_MSTAFF_ID: maxItemId,
-          DECISION_ID: newDecId,
-          ARTICAL_ID: Number(item.ARTICAL_ID),
-          AMOUNT: Number(item.AMOUNT) || 0,
-          PENALTY_TYP: item.PENALTY_TYP || 'غرامة مالية',
-          PENALTY_NAME: item.PENALTY_NAME || 'مخالفة مزاولة المهن الصحية'
-        });
-      }
+    for (const item of items) {
+      db.penaltyDesStaff.push({ PEN_DES_MSTAFF_ID: db.nextId('penaltyDesStaff'), DECISION_ID: newDecId, ...item });
     }
 
     // MVC_MSTAFF_SMS: In Oracle 19c, SMS records are preserved for historical audit only.
@@ -555,12 +744,21 @@ async function startServer() {
   });
 
   app.put('/api/staff-decisions/:id', (req, res) => {
-    const id = Number(req.params.id);
-    const { decision, items } = req.body;
+    const id = toId(req.params.id, 'id');
     const index = db.staffDecisions.findIndex(d => d.DECISION_MSTAFF_ID === id);
     if (index === -1) {
       return res.status(404).json({ error: 'Staff decision not found' });
     }
+    const decision: Record<string, unknown> = pick(req.body?.decision, STAFF_DECISION_FIELDS);
+    validateDecisionFields(decision);
+    if (decision.MSTAFF_ID !== undefined) {
+      const staffId = toId(decision.MSTAFF_ID, 'MSTAFF_ID');
+      if (!db.staff.some(s => s.STAFF_SERIAL === staffId)) {
+        return res.status(400).json({ error: 'MSTAFF_ID does not exist' });
+      }
+      decision.MSTAFF_ID = staffId;
+    }
+    const items = req.body?.items !== undefined ? parseItems(req.body.items, 'مخالفة') : undefined;
 
     db.staffDecisions[index] = {
       ...db.staffDecisions[index],
@@ -568,19 +766,13 @@ async function startServer() {
       DECISION_MSTAFF_ID: id
     };
 
-    if (Array.isArray(items)) {
+    if (items) {
       db.penaltyDesStaff = db.penaltyDesStaff.filter(i => i.DECISION_ID !== id);
-      let maxItemId = db.penaltyDesStaff.reduce((max, i) => Math.max(max, i.PEN_DES_MSTAFF_ID), 6000);
       for (const item of items) {
-        maxItemId++;
-        db.penaltyDesStaff.push({
-          PEN_DES_MSTAFF_ID: maxItemId,
-          DECISION_ID: id,
-          ARTICAL_ID: Number(item.ARTICAL_ID),
-          AMOUNT: Number(item.AMOUNT) || 0,
-          PENALTY_TYP: item.PENALTY_TYP || 'غرامة مالية',
-          PENALTY_NAME: item.PENALTY_NAME || 'مخالفة'
-        });
+        db.penaltyDesStaff.push({ PEN_DES_MSTAFF_ID: db.nextId('penaltyDesStaff'), DECISION_ID: id, ...item });
+      }
+      for (const p of db.paymentStaff) {
+        if (p.DECISION_ID === id) p.PEN_DES_MSTAFF_ID = undefined;
       }
     }
 
@@ -590,7 +782,10 @@ async function startServer() {
   });
 
   app.delete('/api/staff-decisions/:id', (req, res) => {
-    const id = Number(req.params.id);
+    const id = toId(req.params.id, 'id');
+    if (!db.staffDecisions.some(d => d.DECISION_MSTAFF_ID === id)) {
+      return res.status(404).json({ error: 'Staff decision not found' });
+    }
     db.staffDecisions = db.staffDecisions.filter(d => d.DECISION_MSTAFF_ID !== id);
     db.penaltyDesStaff = db.penaltyDesStaff.filter(i => i.DECISION_ID !== id);
     db.staffSms = db.staffSms.filter(s => s.DECISION_MSTAFF_ID !== id);
@@ -600,18 +795,17 @@ async function startServer() {
 
   // Trigger SMS for Staff Decision
   app.post('/api/staff-decisions/:id/send-sms', (req, res) => {
-    const id = Number(req.params.id);
-    const { noticeNum, customText } = req.body;
-    let sms = db.staffSms.find(s => s.DECISION_MSTAFF_ID === id);
+    const id = toId(req.params.id, 'id');
+    const { noticeNum, customText } = parseSmsRequest(req.body || {});
     const decision = db.getFullStaffDecisions().find(d => d.DECISION_MSTAFF_ID === id);
     if (!decision) {
       return res.status(404).json({ error: 'Staff decision not found' });
     }
+    let sms = db.staffSms.find(s => s.DECISION_MSTAFF_ID === id);
 
     if (!sms) {
-      const maxSmsId = db.staffSms.reduce((max, s) => Math.max(max, s.SMS_ID), 8000);
       sms = {
-        SMS_ID: maxSmsId + 1,
+        SMS_ID: db.nextId('staffSms'),
         DECISION_MSTAFF_ID: id,
         MOBILE: decision.staff?.MOBIE_NUM || '0500000000',
         NOTC_1_STATUS: 'قيد المعالجة',
@@ -653,24 +847,30 @@ async function startServer() {
 
   // Register Payment for Staff Decision (MVC_PAYMENT_MSTAFF)
   app.post('/api/staff-decisions/:id/payments', (req, res) => {
-    const id = Number(req.params.id);
-    const { RECEIPT_AMOUNT, RECEIPT_DATE, RECIPT_ID, CREATED_BY, PEN_DES_MSTAFF_ID, FILE_NAME } = req.body;
-
-    if (!RECEIPT_AMOUNT || Number(RECEIPT_AMOUNT) <= 0) {
-      return res.status(400).json({ error: 'Valid receipt amount is required' });
+    const id = toId(req.params.id, 'id');
+    const decision = db.getFullStaffDecisions().find(d => d.DECISION_MSTAFF_ID === id);
+    if (!decision) {
+      return res.status(404).json({ error: 'Staff decision not found' });
     }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const { amount, itemId } = parsePayment(
+      body,
+      decision.totalAmount - decision.paidAmount,
+      decision.items.map(i => i.PEN_DES_MSTAFF_ID),
+      'PEN_DES_MSTAFF_ID'
+    );
 
-    const maxPayId = db.paymentStaff.reduce((max, p) => Math.max(max, p.PAYMENT_ID), 9500);
+    const paymentId = db.nextId('paymentStaff');
     const newPayment = {
-      PAYMENT_ID: maxPayId + 1,
-      RECEIPT_DATE: RECEIPT_DATE || new Date().toISOString().split('T')[0],
-      RECEIPT_AMOUNT: Number(RECEIPT_AMOUNT),
+      PAYMENT_ID: paymentId,
+      RECEIPT_DATE: (body.RECEIPT_DATE as string) || today(),
+      RECEIPT_AMOUNT: amount,
       DECISION_ID: id,
-      PEN_DES_MSTAFF_ID: PEN_DES_MSTAFF_ID ? Number(PEN_DES_MSTAFF_ID) : undefined,
-      CREATED_DATE: new Date().toISOString().split('T')[0],
-      CREATED_BY: CREATED_BY || 'أمين الصندوق',
-      RECIPT_ID: RECIPT_ID || `REC-STF-${Date.now().toString().slice(-6)}`,
-      FILE_NAME: FILE_NAME || `stf_receipt_${maxPayId + 1}.pdf`
+      PEN_DES_MSTAFF_ID: itemId,
+      CREATED_DATE: today(),
+      CREATED_BY: (body.CREATED_BY as string) || 'أمين الصندوق',
+      RECIPT_ID: (body.RECIPT_ID as string) || `REC-STF-${Date.now().toString().slice(-6)}`,
+      FILE_NAME: (body.FILE_NAME as string) || `stf_receipt_${paymentId}.pdf`
     };
 
     db.paymentStaff.push(newPayment);
@@ -680,8 +880,11 @@ async function startServer() {
     res.status(201).json({ payment: newPayment, decision: full });
   });
 
-  // Reset database back to default seed
+  // Reset database back to default seed (disabled in production unless explicitly enabled)
   app.post('/api/seed/reset', (_req, res) => {
+    if (isProduction && process.env.ENABLE_SEED_RESET !== 'true') {
+      return res.status(403).json({ error: 'Database reset is disabled in production' });
+    }
     db.seed();
     res.json({ success: true, message: 'Database reset to initial sample data' });
   });
@@ -791,11 +994,31 @@ async function startServer() {
     });
   });
 
+
+  // Unknown API routes -> JSON 404 (instead of falling through to the SPA)
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({ error: 'Not found' });
+  });
+
+  // Central error handler: never leak stack traces to clients
+  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    if (err instanceof ValidationError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    if (err?.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: 'Malformed JSON body' });
+    }
+    if (err?.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'Request body too large' });
+    }
+    console.error('Unhandled error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  });
+
   // ==========================================
   // VITE / STATIC INTEGRATION
   // ==========================================
-  const isProduction = process.env.NODE_ENV === 'production';
-
   if (!isProduction) {
     const { createServer } = await import('vite');
     const vite = await createServer({
@@ -810,8 +1033,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Node.js API & Web Server running on port ${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`Node.js API & Web Server running on ${HOST}:${PORT}`);
   });
 }
 

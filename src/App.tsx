@@ -106,6 +106,17 @@ export default function App() {
     loadAllData();
   }, [loadAllData]);
 
+  // Runs a delete action and surfaces server errors (e.g. 409 "still referenced").
+  const runDelete = async (action: () => Promise<unknown>) => {
+    try {
+      await action();
+    } catch (err) {
+      console.error(err);
+      alert(`تعذر الحذف: ${(err as Error)?.message || ''}`);
+    }
+    await loadAllData();
+  };
+
   // Handlers for Decisions
   const handleOpenNewDecision = (type: 'facility' | 'staff') => {
     setDecisionModalState({
@@ -156,14 +167,12 @@ export default function App() {
 
   const handleDeleteFacilityDecision = async (id: number) => {
     if (!window.confirm('هل أنت متأكد من رغبتك في حذف قرار المنشأة وبنوده؟')) return;
-    await api.deleteFacilityDecision(id);
-    await loadAllData();
+    await runDelete(() => api.deleteFacilityDecision(id));
   };
 
   const handleDeleteStaffDecision = async (id: number) => {
     if (!window.confirm('هل أنت متأكد من رغبتك في حذف قرار الممارس وبنوده؟')) return;
-    await api.deleteStaffDecision(id);
-    await loadAllData();
+    await runDelete(() => api.deleteStaffDecision(id));
   };
 
   // Payment handler
@@ -188,8 +197,7 @@ export default function App() {
 
   const handleDeleteFacility = async (id: number) => {
     if (!window.confirm('هل أنت متأكد من حذف هذه المنشأة؟')) return;
-    await api.deleteFacility(id);
-    await loadAllData();
+    await runDelete(() => api.deleteFacility(id));
   };
 
   // Staff Handlers
@@ -204,8 +212,7 @@ export default function App() {
 
   const handleDeleteStaff = async (id: number) => {
     if (!window.confirm('هل أنت متأكد من حذف هذا الممارس؟')) return;
-    await api.deleteStaff(id);
-    await loadAllData();
+    await runDelete(() => api.deleteStaff(id));
   };
 
   // Articles Handlers
@@ -220,8 +227,7 @@ export default function App() {
 
   const handleDeleteArticle = async (id: number) => {
     if (!window.confirm('هل أنت متأكد من حذف هذه المادة؟')) return;
-    await api.deleteArticle(id);
-    await loadAllData();
+    await runDelete(() => api.deleteArticle(id));
   };
 
   // Reset database to initial seed

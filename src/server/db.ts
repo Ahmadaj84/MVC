@@ -15,6 +15,20 @@ import {
   FullStaffDecision
 } from '../types/database';
 
+export type SequenceName =
+  | 'facilityType'
+  | 'facility'
+  | 'staff'
+  | 'article'
+  | 'facDecision'
+  | 'penaltyDesFac'
+  | 'facSms'
+  | 'paymentFac'
+  | 'staffDecision'
+  | 'penaltyDesStaff'
+  | 'staffSms'
+  | 'paymentStaff';
+
 // In-Memory Database store initialized with realistic Saudi Health Inspection dataset
 export class MvcDatabase {
   facilityTypes: MvcVpiFacilityType[] = [];
@@ -29,6 +43,10 @@ export class MvcDatabase {
   penaltyDesStaff: MvcPenaltyDesMstaff[] = [];
   staffSms: MvcMstaffSms[] = [];
   paymentStaff: MvcPaymentMstaff[] = [];
+
+  // Monotonic ID sequences (mirrors Oracle SEQUENCEs): IDs are never reused,
+  // even after deletes, so orphaned child rows can't attach to new records.
+  private sequences: Record<SequenceName, number> = {} as Record<SequenceName, number>;
 
   constructor() {
     this.seed();
@@ -548,6 +566,31 @@ export class MvcDatabase {
         FILE_NAME: 'stf_rec_9501.pdf'
       }
     ];
+
+    this.initSequences();
+  }
+
+  private initSequences() {
+    const max = (values: number[], floor: number) => values.reduce((m, v) => Math.max(m, v), floor);
+    this.sequences = {
+      facilityType: max(this.facilityTypes.map(t => t.FACILITY_TYPE_SN), 0),
+      facility: max(this.facilities.map(f => f.FACILITY_SERIAL), 100),
+      staff: max(this.staff.map(s => s.STAFF_SERIAL), 200),
+      article: max(this.articles.map(a => a.ARTICAL_ID), 0),
+      facDecision: max(this.facDecisions.map(d => d.DECISION_FAC_ID), 1000),
+      penaltyDesFac: max(this.penaltyDesFac.map(i => i.PEN_DES_FAC_ID), 5000),
+      facSms: max(this.facSms.map(s => s.SMS_ID), 7000),
+      paymentFac: max(this.paymentFac.map(p => p.PAYMENT_ID), 9000),
+      staffDecision: max(this.staffDecisions.map(d => d.DECISION_MSTAFF_ID), 2000),
+      penaltyDesStaff: max(this.penaltyDesStaff.map(i => i.PEN_DES_MSTAFF_ID), 6000),
+      staffSms: max(this.staffSms.map(s => s.SMS_ID), 8000),
+      paymentStaff: max(this.paymentStaff.map(p => p.PAYMENT_ID), 9500)
+    };
+  }
+
+  nextId(name: SequenceName): number {
+    this.sequences[name] += 1;
+    return this.sequences[name];
   }
 
   // Helper Methods for Full Facility Decisions
