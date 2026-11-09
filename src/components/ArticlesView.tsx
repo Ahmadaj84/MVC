@@ -54,7 +54,7 @@ export const ArticlesView: React.FC<ArticlesViewProps> = ({
       setEditingArticle(null);
     } catch (err) {
       console.error(err);
-      alert('حدث خطأ أثناء حفظ مادة المخالفة');
+      alert(`حدث خطأ أثناء حفظ مادة المخالفة: ${(err as Error)?.message || ''}`);
     } finally {
       setIsSaving(false);
     }

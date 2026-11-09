@@ -6,16 +6,19 @@ export function formatSAR(amount: number | undefined | null): string {
 export function toHijriDate(gregorianDateStr?: string): string {
   try {
     const d = gregorianDateStr ? new Date(gregorianDateStr) : new Date();
-    if (isNaN(d.getTime())) return '1447-01-01 هـ';
-    // Use Intl DateTimeFormat with islamic-umalqura calendar
-    const formatter = new Intl.DateTimeFormat('ar-SA-u-ca-islamic-umalqura', {
+    if (isNaN(d.getTime())) return '1447-01-01';
+    // Umm al-Qura calendar, Latin digits, formatted as YYYY-MM-DD to match stored DECISION_DATE_H values.
+    const parts = new Intl.DateTimeFormat('en-u-ca-islamic-umalqura-nu-latn', {
       year: 'numeric',
       month: '2-digit',
-      day: '2-digit'
-    });
-    return formatter.format(d);
+      day: '2-digit',
+      timeZone: 'UTC'
+    }).formatToParts(d);
+    const get = (t: string) => parts.find(p => p.type === t)?.value || '';
+    const year = get('year').replace(/\D/g, '');
+    return `${year}-${get('month')}-${get('day')}`;
   } catch (_e) {
-    return '1447-01-01 هـ';
+    return '1447-01-01';
   }
 }
 

@@ -69,7 +69,7 @@ export const StaffView: React.FC<StaffViewProps> = ({
       setEditingStaff(null);
     } catch (err) {
       console.error(err);
-      alert('حدث خطأ أثناء حفظ الممارس');
+      alert(`حدث خطأ أثناء حفظ الممارس: ${(err as Error)?.message || ''}`);
     } finally {
       setIsSaving(false);
     }

@@ -64,7 +64,7 @@ export const FacilitiesView: React.FC<FacilitiesViewProps> = ({
       setEditingFacility(null);
     } catch (err) {
       console.error(err);
-      alert('حدث خطأ أثناء حفظ المنشأة');
+      alert(`حدث خطأ أثناء حفظ المنشأة: ${(err as Error)?.message || ''}`);
     } finally {
       setIsSaving(false);
     }

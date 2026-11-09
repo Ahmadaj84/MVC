@@ -11,14 +11,17 @@ interface PaymentModalProps {
   onRegisterPayment: (id: number, payload: any) => Promise<void>;
 }
 
-export const PaymentModal: React.FC<PaymentModalProps> = ({
+// Wrapper keeps the early return outside the component that uses hooks
+// (calling hooks after a conditional return breaks React's rules of hooks).
+export const PaymentModal: React.FC<PaymentModalProps> = props =>
+  props.isOpen ? <PaymentModalContent {...props} /> : null;
+
+const PaymentModalContent: React.FC<PaymentModalProps> = ({
   decision,
   type,
-  isOpen,
   onClose,
   onRegisterPayment
 }) => {
-  if (!isOpen) return null;
 
   const decisionId = type === 'facility'
     ? (decision as FullFacDecision).DECISION_FAC_ID
@@ -43,6 +46,10 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
       alert('يرجى تحديد مبلغ سداد صحيح');
       return;
     }
+    if (receiptAmount > remaining) {
+      alert('المبلغ المدخل يتجاوز المبلغ المتبقي للتحصيل');
+      return;
+    }
 
     setIsSubmitting(true);
     try {
@@ -51,12 +58,15 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
         RECEIPT_DATE: receiptDate,
         RECIPT_ID: receiptId,
         CREATED_BY: createdBy,
-        PEN_DES_FAC_ID: selectedItemId ? Number(selectedItemId) : undefined
+        // The staff endpoint expects PEN_DES_MSTAFF_ID; facility expects PEN_DES_FAC_ID.
+        [type === 'facility' ? 'PEN_DES_FAC_ID' : 'PEN_DES_MSTAFF_ID']: selectedItemId
+          ? Number(selectedItemId)
+          : undefined
       });
       onClose();
     } catch (err) {
       console.error(err);
-      alert('حدث خطأ أثناء تسجيل السداد');
+      alert(`حدث خطأ أثناء تسجيل السداد: ${(err as Error)?.message || ''}`);
     } finally {
       setIsSubmitting(false);
     }
